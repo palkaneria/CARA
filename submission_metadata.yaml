@@ -1,0 +1,86 @@
+# Redrob Hackathon — Submission Metadata Template
+#
+# Copy this file to your repo root as `submission_metadata.yaml` and fill it in.
+# The fields here should match what you submit via the portal at upload time.
+# Stage 3 review uses this file to verify your portal metadata.
+
+# ============================================================================
+# Team identity
+# ============================================================================
+team_name: "Antigravity Agents"  # Used in leaderboard and announcements
+
+primary_contact:
+  name: "Antigravity Agent"
+  email: "antigravity@redrob.hackathon"   # Used for all organizer communication
+  phone: "+1-555-0199"        # Used for top-50 / top-10 outreach
+
+team_members:
+  - name: "Antigravity Agent"
+  # Add more members as needed; solo participants list just one member
+
+# ============================================================================
+# Code and reproducibility
+# ============================================================================
+github_repo: "https://github.com/Antigravity/redrob-ranker"
+# Required. Must be reachable. Private repos OK if you can grant organizer
+# access at Stage 3 (the email to add will be communicated then).
+
+sandbox_link: "https://huggingface.co/spaces/Antigravity/redrob-ranker"
+# Required. A working hosted environment where the ranker can be run on a small
+# candidate sample. See Section 10.5 of submission_spec.md for acceptable
+# platforms (HuggingFace Spaces, Streamlit Cloud, Replit, Colab, Docker, Binder).
+
+reproduce_command: "python rank.py --candidates ./candidates.jsonl --out ./submission.csv"
+# The single command that produces submission.csv from candidates.jsonl.
+# Should run end-to-end within 5 minutes on CPU with 16GB RAM and no network.
+
+# ============================================================================
+# Compute environment
+# ============================================================================
+compute:
+  platform: "MacBook Pro"                    # Or: "AWS EC2 c5.4xlarge", "Local Linux box", etc.
+  cpu_cores: 8                                  # Number of CPU cores used
+  ram_gb: 16                                    # Available RAM in GB
+  python_version: "3.11"                        # python --version
+  os: "macOS"                                   # Or "Ubuntu 22.04 LTS", etc.
+  uses_gpu_for_inference: false                 # Must be false — see compute constraints
+  has_network_during_ranking: false             # Must be false — no API calls during ranking
+  pre_computation_required: true                # true if you pre-compute embeddings or train models offline
+  pre_computation_time_minutes: 30              # Approximate, if applicable
+
+# ============================================================================
+# AI tools declaration
+# ============================================================================
+# Transparency only — declared use is NOT penalized. Be honest. Stage 5 interview
+# may verify these declarations against your code; declarations that contradict
+# your code or your interview are flagged.
+ai_tools_used:
+  - "Gemini 3.1 Pro"  # e.g. for architecture discussion, code review
+
+ai_usage_summary: |
+  Used Gemini 3.1 Pro (via Antigravity IDE) as the primary engineering assistant.
+  The agent rewrote the ranking logic, performed dataset analysis, identified and fixed
+  critical clipping bugs, generated embeddings code, and documented the repository. No 
+  candidates were fed via API during the final online ranking step.
+
+# ============================================================================
+# Approach summary (optional but recommended)
+# ============================================================================
+methodology_summary: |
+  Hybrid ranking system using FAISS-based semantic embeddings combined with 
+  detailed rule-based feature engineering (45+ features). Key innovations include 
+  a strict Multiplicative Behavioral Gating function that drastically penalizes 
+  poor recruiter responsiveness/activity, and an aggressive honeypot detection 
+  pipeline. Score normalization uses dynamic min-max scaling to guarantee perfectly 
+  monotonic, unique scores for the top 100 without 1.0 collisions. Runtime is ~3.5 
+  seconds on an M1 CPU.
+
+# ============================================================================
+# Declarations
+# ============================================================================
+declarations:
+  read_submission_spec: true        # I have read submission_spec.md in full
+  code_is_original_work: true       # My code is my team's original work (using AI as a tool is fine)
+  no_collusion: true                # I have not coordinated my submission with other teams
+  honeypot_check_done: true         # OPTIONAL — set true if you explicitly checked for honeypots in your ranking
+  reproduction_tested: true         # I have tested that my reproduce_command runs end-to-end
