@@ -5,13 +5,12 @@ ONLINE RANKING SCRIPT — rank.py
 The 5-minute, CPU-only, no-network ranker.
 
 What it does:
-  1. Loads pre-computed artifacts (features, embeddings, honeypot flags)
-  2. Loads FAISS index, retrieves top-2000 candidates by embedding similarity
+  1. Loads pre-computed artifacts (features, embeddings, honeypot flags, and parsed JD metadata)
+  2. Loads FAISS index, retrieves top candidate matches by embedding similarity
   3. Runs hybrid scoring: embedding_sim × feature_score × behavioral_multiplier
   4. Honeypot penalty applied (forces them to bottom)
-  5. Re-ranks top-200 using LightGBM or rule-based model
-  6. Generates rule-based reasoning for top-100
-  7. Outputs submission CSV
+  5. Generates dynamic data-driven reasoning with confidence tiers
+  6. Outputs submission CSV conforming strictly to hackathon reproduction format
 
 Usage:
   python rank.py --candidates ./candidates.jsonl --artifacts ./artifacts --out ./submission.csv
@@ -74,35 +73,46 @@ PREFERRED_LOCATIONS = {
 # ---------------------------------------------------------------------------
 # REASONING TEMPLATES
 # ---------------------------------------------------------------------------
-def generate_reasoning(candidate: Dict[str, Any], features: Dict[str, float], score: float, rank: int) -> str:
+
+
+def generate_reasoning(candidate: Dict[str, Any], features: Dict[str, float], score: float, rank: int, jd_meta: Optional[Dict[str, Any]] = None) -> str:
     """
     Generates an analytical, fact-grounded 1-2 sentence reasoning explaining the rank.
     Incorporates specific skill match percentages, career stability warnings, behavioral signals,
     and a confidence score. Fully compliant with requirements (no placeholders, real values).
     """
-    profile = candidate.get("profile", {})
-    career = candidate.get("career_history", [])
-    skills = candidate.get("skills", [])
-    sigs = candidate.get("redrob_signals", {})
+    profile = candidate.get("profile", {}) or {}
+    career = candidate.get("career_history", []) or []
+    skills = candidate.get("skills", []) or []
+    sigs = candidate.get("redrob_signals", {}) or {}
 
     yoe = profile.get("years_of_experience", 0.0)
     title = profile.get("current_title", "unknown role")
     company = profile.get("current_company", "unknown company")
     location = profile.get("location", "unknown location")
 
+    if jd_meta is None:
+        jd_meta = {}
+    must_have_skills = set(jd_meta.get("must_have_skills", [
+        "embeddings", "sentence-transformers", "vector search", "faiss", "pinecone",
+        "weaviate", "qdrant", "milvus", "elasticsearch", "opensearch", "retrieval",
+        "ranking", "nlp", "python", "rag", "information retrieval",
+        "semantic search", "dense retrieval", "hybrid search",
+        "recommendation systems", "learning to rank", "xgboost", "lightgbm",
+        "transformers", "bert", "llm", "fine-tuning", "lora", "qlora"
+    ]))
+    
+    yoe_min = jd_meta.get("yoe_min", 5.0)
+    notice_preferred = jd_meta.get("notice_preferred", 30)
+
     # Get top 4 relevant skills for this candidate
-    relevant_skill_kws = {
-        "embed", "retriev", "rank", "vector", "faiss", "pinecone", "weaviate", "qdrant", 
-        "milvus", "elasticsearch", "opensearch", "nlp", "rag", "transformer", "llm", 
-        "semantic", "search", "python", "recommendation", "xgboost", "lightgbm", "fine-tun"
-    }
     relevant_skills = [
         sk["name"] for sk in sorted(
             skills,
             key=lambda s: s.get("endorsements", 0) + s.get("duration_months", 0),
             reverse=True
         )
-        if any(kw in sk.get("name", "").lower() for kw in relevant_skill_kws)
+        if sk and sk.get("name", "").lower() in must_have_skills
     ][:4]
 
     days_inactive = int(features.get("_days_inactive", 999))
@@ -110,16 +120,16 @@ def generate_reasoning(candidate: Dict[str, Any], features: Dict[str, float], sc
     recruiter_resp = features.get("_recruiter_response", 0.0)
     must_hits = int(features.get("_must_have_hits", 0))
     
-    # Calculate percentage match based on 8 key must-have skill categories
-    # 8 must-have categories represents the must_have_ratio denominator
-    must_have_pct = int(min(must_hits / 8.0, 1.0) * 100)
+    # Calculate percentage match based on must-have skill categories
+    n_must_haves = len(must_have_skills) or 8.0
+    must_have_pct = int(min(must_hits / n_must_haves, 1.0) * 100)
 
     # Skill string
     if relevant_skills:
         skill_str = ", ".join(relevant_skills)
     else:
-        all_top = [sk["name"] for sk in sorted(skills, key=lambda s: s.get("endorsements", 0), reverse=True)][:3]
-        skill_str = ", ".join(all_top) if all_top else "general software engineering"
+        all_top = [sk["name"] for sk in sorted(skills, key=lambda s: s.get("endorsements", 0), reverse=True) if sk][:3]
+        skill_str = ", ".join(all_top) if all_top else "relevant engineering skills"
 
     # Activity string
     if days_inactive <= 7:
@@ -134,9 +144,9 @@ def generate_reasoning(candidate: Dict[str, Any], features: Dict[str, float], sc
     # Notice string
     if notice <= 15:
         notice_str = "immediate availability"
-    elif notice <= 30:
+    elif notice <= notice_preferred:
         notice_str = f"{notice}d notice (ideal)"
-    elif notice <= 60:
+    elif notice <= notice_preferred + 30:
         notice_str = f"{notice}d notice"
     else:
         notice_str = f"{notice}d notice period"
@@ -144,7 +154,7 @@ def generate_reasoning(candidate: Dict[str, Any], features: Dict[str, float], sc
     # Job hopping / title chaser warning if average tenure is low
     avg_tenure_months = 0.0
     if career:
-        durations = [j.get("duration_months", 0) for j in career if j.get("duration_months", 0) > 0]
+        durations = [j.get("duration_months", 0) for j in career if j and j.get("duration_months", 0) > 0]
         if durations:
             avg_tenure_months = sum(durations) / len(durations)
     
@@ -153,14 +163,13 @@ def generate_reasoning(candidate: Dict[str, Any], features: Dict[str, float], sc
         stability_warning = " (note: low tenure stability)"
 
     # Determine confidence level
-    # High confidence if high score, high must-have coverage, suitable YOE, good engagement, and clear margin
     yoe_score = features.get("yoe_score", 0.0)
     margin = features.get("_margin", 0.0)
-    if score >= 0.85 and must_hits >= 5 and yoe_score >= 0.8 and recruiter_resp >= 0.5 and margin > 0.005:
+    if score >= 0.85 and must_hits >= (n_must_haves * 0.6) and yoe_score >= 0.8 and recruiter_resp >= 0.5 and margin > 0.005:
         confidence = "High (Clear Tier 1)"
-    elif score >= 0.80 and must_hits >= 4:
+    elif score >= 0.80 and must_hits >= (n_must_haves * 0.5):
         confidence = "High"
-    elif score >= 0.60 and must_hits >= 3:
+    elif score >= 0.60 and must_hits >= (n_must_haves * 0.3):
         confidence = "Medium"
     else:
         confidence = "Low"
@@ -175,7 +184,7 @@ def generate_reasoning(candidate: Dict[str, Any], features: Dict[str, float], sc
     elif rank <= 50:
         sentence = (
             f"{yoe:.1f}y experience as {title} with {must_have_pct}% must-have skill coverage ({skill_str}). "
-            f"Satisfactory alignment with {location}-based hybrid preference, {notice_str}, and {activity_str}."
+            f"Satisfactory alignment with {location}-based preference, {notice_str}, and {activity_str}."
         )
     elif rank <= 80:
         sentence = (
@@ -184,8 +193,8 @@ def generate_reasoning(candidate: Dict[str, Any], features: Dict[str, float], sc
         )
     else:
         gaps = []
-        if must_hits < 3:
-            gaps.append("limited core ML/retrieval skills")
+        if must_hits < (n_must_haves * 0.3):
+            gaps.append("limited core skills")
         if days_inactive > 90:
             gaps.append("reduced platform activity")
         if features.get("consulting_penalty", 0) > 0.5:
@@ -287,6 +296,7 @@ def main() -> None:
     # Meta (includes JD embedding)
     with open(artifacts_dir / "meta.json") as f:
         meta = json.load(f)
+    jd_meta = meta.get("jd_meta", {})
 
     # --- EMBEDDING SIMILARITY (optional, use if available) ---
     use_embeddings = False
@@ -395,8 +405,12 @@ def main() -> None:
 
     # --- GET TOP-200 CANDIDATES ---
     logger.info("Selecting top candidates...")
-    top_200_idx = np.argpartition(scores, -200)[-200:]
-    top_200_idx = top_200_idx[np.argsort(scores[top_200_idx])[::-1]]
+    k = min(200, len(scores))
+    if k < 200:
+        top_200_idx = np.argsort(scores)[::-1]
+    else:
+        top_200_idx = np.argpartition(scores, -k)[-k:]
+        top_200_idx = top_200_idx[np.argsort(scores[top_200_idx])[::-1]]
 
     # Verify no honeypot in top 100 after penalty
     honeypot_in_top200 = sum(
@@ -449,7 +463,7 @@ def main() -> None:
                         for j, name in enumerate(feature_names)}
             next_score = float(scores[top_200_idx[i+1]]) if i + 1 < len(top_200_idx) else 0.0
             feat_dict["_margin"] = score - next_score
-            reasoning = generate_reasoning(candidate, feat_dict, score, rank)
+            reasoning = generate_reasoning(candidate, feat_dict, score, rank, jd_meta)
 
         output_rows.append({
             "candidate_id": cid,
@@ -475,31 +489,32 @@ def main() -> None:
     edu_tiers = []
     willing_relocate_count = 0
     in_preferred_loc_count = 0
+    preferred_locations = set(jd_meta.get("preferred_locations", PREFERRED_LOCATIONS))
 
     for r in output_rows:
         candidate = top_200_data.get(r["candidate_id"])
         if candidate:
-            profile = candidate.get("profile", {})
-            sigs = candidate.get("redrob_signals", {})
-            loc = profile.get("location", "").lower()
-            country = profile.get("country", "").lower()
+            profile = candidate.get("profile", {}) or {}
+            sigs = candidate.get("redrob_signals", {}) or {}
+            loc = (profile.get("location") or "").lower()
+            country = (profile.get("country") or "").lower()
             locations.append(f"{loc}, {country}" if loc else country)
 
-            if country == "india" and any(pl in loc for pl in PREFERRED_LOCATIONS):
+            if any(pl in loc or pl in country for pl in preferred_locations):
                 in_preferred_loc_count += 1
             if sigs.get("willing_to_relocate", False):
                 willing_relocate_count += 1
 
-            education = candidate.get("education", [])
+            education = candidate.get("education", []) or []
             if education:
                 best_tier = max(
-                    e.get("tier", "unknown") for e in education
+                    e.get("tier", "unknown") for e in education if e
                 )
                 edu_tiers.append(best_tier)
             else:
                 edu_tiers.append("none")
 
-    logger.info(f"  Geographic Audit: {in_preferred_loc_count}% in preferred locations (Pune/Noida/etc.)")
+    logger.info(f"  Geographic Audit: {in_preferred_loc_count}% in preferred locations ({list(preferred_locations)[:3]}...)")
     logger.info(f"  Relocation Audit: {willing_relocate_count}% willing to relocate")
     tier_counts = {t: edu_tiers.count(t) for t in set(edu_tiers)}
     logger.info(f"  Education Tier Audit: {tier_counts}")

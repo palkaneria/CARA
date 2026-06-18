@@ -10,3 +10,6 @@ torch==2.12.0
 
 # Vector search
 faiss-cpu==1.14.3
+
+# PDF Documentation / Presentation Deck Generation
+reportlab==4.1.0
