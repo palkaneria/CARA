@@ -858,7 +858,7 @@ def main() -> None:
             from sentence_transformers import SentenceTransformer
             import faiss
 
-            model = SentenceTransformer("all-MiniLM-L6-v2")  # 384-dim, fast, ~80MB
+            model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")  # 384-dim, fast, ~80MB
 
             # Build candidate texts
             logger.info("  Building candidate texts...")

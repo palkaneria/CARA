@@ -210,6 +210,43 @@ def generate_reasoning(candidate: Dict[str, Any], features: Dict[str, float], sc
     return f"{sentence} [Confidence: {confidence}]"
 
 
+def build_candidate_text(candidate: Dict[str, Any]) -> str:
+    """
+    Builds a rich text representation of a candidate for embedding.
+    Emphasizes signals that matter for this JD.
+    """
+    profile = candidate.get("profile", {}) or {}
+    career = candidate.get("career_history", []) or []
+    skills = candidate.get("skills", []) or []
+
+    text_parts = [
+        profile.get("current_title", ""),
+        profile.get("headline", ""),
+        profile.get("summary", ""),
+    ]
+
+    sorted_skills = sorted(
+        skills,
+        key=lambda s: s.get("endorsements", 0) + s.get("duration_months", 0) if s else 0,
+        reverse=True
+    )
+    skill_text = ", ".join(
+        f"{s['name']} ({s.get('proficiency', '')})"
+        for s in sorted_skills[:15]
+        if s and s.get("name")
+    )
+    text_parts.append(f"Skills: {skill_text}")
+
+    for job in career[:3]:
+        if job:
+            text_parts.append(
+                f"{job.get('title', '')} at {job.get('company', '')}: "
+                f"{job.get('description', '')[:300]}"
+            )
+
+    return " ".join(filter(None, text_parts))[:2048]
+
+
 # ---------------------------------------------------------------------------
 # SCORE COMBINATION
 # ---------------------------------------------------------------------------
@@ -440,6 +477,110 @@ def main() -> None:
 
     logger.info(f"  Loaded {len(top_200_data)} candidate profiles")
     logger.info(f"  Time elapsed: {time.time()-t_start:.1f}s")
+
+    # --- DYNAMIC EMBEDDING RE-RANKING (if precomputed embeddings are missing) ---
+    dynamic_embeddings_computed = False
+    if not use_embeddings and (meta.get("jd_embedding") is not None or jd_meta.get("jd_text") is not None):
+        logger.info("Precomputed embeddings not found. Dynamically computing embeddings for top candidates...")
+        try:
+            from sentence_transformers import SentenceTransformer
+            # Load model on CPU
+            model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+            
+            # Prepare texts for the top 200 candidates in the current sorted order
+            top_ids_ordered = [candidate_ids[idx] for idx in top_200_idx]
+            top_texts = []
+            for cid in top_ids_ordered:
+                c = top_200_data.get(cid, {})
+                top_texts.append(build_candidate_text(c))
+                
+            # Encode candidates (and JD if needed)
+            logger.info("  Encoding top candidates and job description...")
+            
+            jd_text = jd_meta.get("jd_text", "")
+            if meta.get("jd_embedding") is not None:
+                jd_emb = np.array(meta["jd_embedding"], dtype=np.float32)
+                cand_embs = model.encode(
+                    top_texts,
+                    batch_size=64,
+                    show_progress_bar=False,
+                    normalize_embeddings=True,
+                    convert_to_numpy=True
+                )
+            elif jd_text:
+                # Encode both together
+                all_embs = model.encode(
+                    [jd_text] + top_texts,
+                    batch_size=64,
+                    show_progress_bar=False,
+                    normalize_embeddings=True,
+                    convert_to_numpy=True
+                )
+                jd_emb = all_embs[0]
+                cand_embs = all_embs[1:]
+            else:
+                raise ValueError("Neither precomputed JD embedding nor JD text is available")
+            
+            # Compute cosine similarities
+            dyn_sims = cand_embs @ jd_emb
+            
+            # Normalize to [0, 1]
+            sim_min, sim_max = dyn_sims.min(), dyn_sims.max()
+            dyn_sims_norm = (dyn_sims - sim_min) / (sim_max - sim_min + 1e-8)
+            
+            # Map candidate_id to normalized similarity
+            sim_map = {cid: float(dyn_sims_norm[j]) for j, cid in enumerate(top_ids_ordered)}
+            
+            # Recompute scores for the top-200 candidates using original weights
+            logger.info("  Recomputing hybrid scores with dynamic embeddings...")
+            feat_name_idx = {name: i for i, name in enumerate(feature_names)}
+            for idx in top_200_idx:
+                cid = candidate_ids[idx]
+                sim = sim_map.get(cid, 0.0)
+                
+                # Fetch features
+                feat_dict = {name: float(feature_matrix[idx, feat_name_idx[name]]) for name in feature_names}
+                
+                # Recompute skill score with original weights
+                location_combined = (feat_dict["location_score"] + 0.5 * feat_dict["willing_to_relocate"]) / 1.5
+                edu_combined = 0.5 * feat_dict["edu_tier_score"] + 0.5 * feat_dict["has_relevant_degree"]
+                
+                skill_score = (
+                    W_MUST_HAVE   * feat_dict["must_have_ratio"] +
+                    W_TITLE       * feat_dict["title_score"] +
+                    W_YOE         * feat_dict["yoe_score"] +
+                    W_ML_CAREER   * feat_dict["ml_career_ratio"] +
+                    W_LOCATION    * location_combined +
+                    W_EDUCATION   * edu_combined +
+                    W_EMBEDDING   * sim
+                )
+                
+                core_bonus = 0.05 * feat_dict["core_ml_depth"]
+                trust_bonus = 0.03 * feat_dict["skill_trust"]
+                assess_bonus = 0.04 * feat_dict["avg_assessment"]
+                cons_pen = CONSULTING_PENALTY_WEIGHT * feat_dict["consulting_penalty"]
+                
+                raw_score = skill_score + core_bonus + trust_bonus + assess_bonus - cons_pen
+                scores[idx] = float(np.clip(raw_score * feat_dict["behavioral_multiplier"], 0.0, 1.0))
+                
+            # Perform min-max scaling across the top-200 scores to preserve relative ranking and avoid ties
+            top_scores = scores[top_200_idx]
+            s_min, s_max = top_scores.min(), top_scores.max()
+            scores[top_200_idx] = (top_scores - s_min) / (s_max - s_min + 1e-8)
+            
+            # Apply honeypot penalty
+            for cid in honeypot_ids:
+                if cid in id_to_idx:
+                    idx = id_to_idx[cid]
+                    scores[idx] = HONEYPOT_MAX_SCORE * np.random.uniform(0.5, 1.0)
+                    
+            # Re-sort the top 200 based on the refined scores
+            top_200_idx = top_200_idx[np.argsort(scores[top_200_idx])[::-1]]
+            dynamic_embeddings_computed = True
+            logger.info("  Dynamic re-ranking complete.")
+            
+        except Exception as e:
+            logger.warning(f"  Failed dynamic re-ranking: {e}. Falling back to feature-only shortlist.")
 
     # --- GENERATE FINAL TOP-100 WITH REASONING ---
     logger.info("Generating reasoning for top-100...")
